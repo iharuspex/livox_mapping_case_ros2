@@ -1,5 +1,6 @@
 #include <cmath>
 #include <memory>
+#include <chrono>
 #include <stdio.h>
 
 #include <rclcpp/rclcpp.hpp>
@@ -21,6 +22,8 @@
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
+using namespace std::chrono_literals;
+
 typedef pcl::PointXYZI PointType;
 
 // Global variables
@@ -41,6 +44,9 @@ rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_apx_rpy;
 
 pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudFullResColor_pcd(new pcl::PointCloud<pcl::PointXYZRGB>());
 
+rclcpp::TimerBase::SharedPtr timer;
+rclcpp::Time last_msg_time;
+
 // Prototypes
 //=================================================================================================
 bool lidar_imu_rtk_process(uint32_t num_lidar, uint32_t num_imu, uint32_t num_rtk);
@@ -50,6 +56,10 @@ bool average_quaternion(nav_msgs::msg::Odometry &start, nav_msgs::msg::Odometry 
 bool mercator_proj(double B0, double L0, double B, double L, double &X, double&Y);
 
 void RGBTrans(PointType const * const pi, pcl::PointXYZRGB * const po);
+
+void savePointCloudToFile(const std::string& map_file_path,
+                          const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& laserCloudFullResColor_pcd,
+                          const rclcpp::Logger &logger);
 
 
 // Time functions
@@ -100,14 +110,15 @@ void apxCbk(const livox_interfaces::msg::CustomMsg::SharedPtr msg)
     pub_apx_p2->publish(p2_apx);
 }
 
-void lidarCbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const rclcpp::Logger &logger)
+void lidarCbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const rclcpp::Node::SharedPtr node)
 {
-    RCLCPP_INFO(logger, "WTF???");
+    RCLCPP_INFO(node->get_logger(), "WTF???");
+    last_msg_time = node->now();
     if(lidar_datas.size() > 0)
     {
         if(to_time(lidar_datas[lidar_datas.size()-1]) > to_time(msg))
         {
-            RCLCPP_INFO(logger, "lidar time error");
+            RCLCPP_INFO(node->get_logger(), "lidar time error");
             return;
         }
     }
@@ -138,6 +149,11 @@ void rtkCbk(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
 // Main
 //=================================================================================================
 int main(int argc, char *argv[]) {
+    rtk2lidar << -1,  0, 0, 0,
+                  0, -1, 0, 0,
+                  0,  0, 1, 0,
+                  0,  0, 0, 1;
+
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("livox_mapping_case");
 
@@ -148,8 +164,8 @@ int main(int argc, char *argv[]) {
     pub_apx_rpy = node->create_publisher<nav_msgs::msg::Odometry> ("pub_apx_rpy", 1000);
 
     auto sub_point = node->create_subscription<sensor_msgs::msg::PointCloud2>
-        ("/livox/lidar", 1000, [logger](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-                                    lidarCbk(msg, logger);
+        ("/livox/lidar", 1000, [node](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+                                    lidarCbk(msg, node);
                                 });
     auto sub_imu = node->create_subscription<nav_msgs::msg::Odometry> ("pub_apx_rpy", 20000, imuCbk);
 
@@ -157,9 +173,8 @@ int main(int argc, char *argv[]) {
     pub_odometry = node->create_publisher<nav_msgs::msg::Odometry> ("pub_odometry", 1);
 
     std::string map_file_path;
-    std::cout << "ASS" << std::endl;
-    node->get_parameter("~map_file_path", map_file_path);
-    std::cout << "ASS2" << std::endl;
+    node->declare_parameter<std::string> ("map_file_path", "");
+    node->get_parameter("map_file_path", map_file_path);
 
     uint32_t num_lidar = 0;
     uint32_t num_imu = 1;
@@ -171,7 +186,21 @@ int main(int argc, char *argv[]) {
 
     bool init_flag = false;
 
-    while (rclcpp::ok()) {
+    bool stop_flag = false;
+
+    timer = node->create_wall_timer(
+        1s,
+        [&]() {
+            auto time_sinse_last_msg = (node->now() - last_msg_time).seconds();
+            if (time_sinse_last_msg > 5.0) {
+                RCLCPP_INFO(logger, "No more data, shutting down...");
+                stop_flag = true;
+            }
+        }
+    );
+
+    last_msg_time = node->now();
+    while (rclcpp::ok() && !stop_flag) {
         rclcpp::spin_some(node);
 
         if (num_lidar < lidar_datas.size()) {
@@ -226,6 +255,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    RCLCPP_INFO(logger, "%s", map_file_path.c_str());
+
+    if (!map_file_path.empty()) {
+        savePointCloudToFile(map_file_path, laserCloudFullResColor_pcd, logger);
+    }
+
+    pub_cloud.reset();
+    pub_odometry.reset();
     rclcpp::shutdown();
     return 0;
 }
@@ -281,6 +318,7 @@ bool lidar_imu_rtk_process(uint32_t num_lidar, uint32_t num_imu, uint32_t num_rt
         if(!mercator_proj(LLA0[1]*M_PI/180, LLA0[0]*M_PI/180, LLA[1]*M_PI/180, LLA[0]*M_PI/180, p[0], p[1]))
         {
             // Mercator projection
+            printf("No mercator\n");
             continue;
         }
         p[2] = LLA[2];
@@ -345,12 +383,12 @@ bool lidar_imu_rtk_process(uint32_t num_lidar, uint32_t num_imu, uint32_t num_rt
     geometry_msgs::msg::TransformStamped aftMappedTrans;
 
     aftMappedTrans.header.stamp = rclcpp::Clock().now();
-    aftMappedTrans.header.frame_id = "camera_init";
-    aftMappedTrans.child_frame_id = "aft_mapped";
+    aftMappedTrans.header.frame_id = "/camera_init";
+    aftMappedTrans.child_frame_id = "/aft_mapped";
 
     tf2::Quaternion tfQ;
     tfQ.setW(QQ.w());
-    tfQ.setX(QQ.x());
+    tfQ.setX(QQ.x());;
     tfQ.setY(QQ.y());
     tfQ.setZ(QQ.z());
 
@@ -467,4 +505,22 @@ bool mercator_proj(double B0, double L0, double B, double L, double &X, double&Y
     X = K * log(tan(M_PI_4+B/2) * pow((1-e*sin(B))/(1+e*sin(B)), e/2));
 
     return true;
+}
+
+void savePointCloudToFile(const std::string& map_file_path,
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& laserCloudFullResColor_pcd,
+    const rclcpp::Logger &logger)
+{
+    std::string all_points_filename = map_file_path + "/all_points.pcd";
+
+    try {
+        if (pcl::io::savePCDFileBinary(all_points_filename, *laserCloudFullResColor_pcd) == -1)
+        {
+            RCLCPP_ERROR(logger, "Failed to save point cloud to %s", all_points_filename.c_str());
+            return;
+        }
+        RCLCPP_INFO(logger, "Point cloud saved successfully to %s", all_points_filename.c_str());
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(logger, "Exception while saving point cloud: %s", e.what());
+    }
 }

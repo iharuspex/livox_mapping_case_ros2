@@ -19,7 +19,9 @@ def generate_launch_description():
     output='screen',
     # prefix='gdbserver localhost:3000',
     name='livox_mapping_case',
-    parameters=[" "]
+    parameters=[{
+      'map_file_path': '/home/haruspex/Documents/'
+    }]
   )
 
   livox_rviz = Node(
