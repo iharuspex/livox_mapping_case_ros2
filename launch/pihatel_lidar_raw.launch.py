@@ -17,7 +17,7 @@ gnss_driver_path = get_package_share_directory('pihatel_ros2_driver')
 
 livox_lidar_rviz_launch = IncludeLaunchDescription(
   PythonLaunchDescriptionSource(
-    livox_ros2_driver_path + '/launch/livox_lidar_rviz_launch.py'
+    livox_ros2_driver_path + '/launch/livox_lidar_launch.py'
   )
 )
 
